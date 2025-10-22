@@ -17,7 +17,7 @@ Supports:
 - citations for web_search
 - Streaming responses
 - Prompt caching (server-side)
-- Promt Caching of System Promts, Messages- and Tools Array
+- Promt Caching of System Promts, Messages- and Tools Array (controllable via Valve)
 - Comprehensive error handling
 - Image processing
 - Web_Search Toggle Action
@@ -32,6 +32,9 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.3.9
+- Added fine grained cache control valve with 4 levels: disabled, tools only, tools + system prompt, tools + system prompt + user messages
+
 v0.3.8
 - Removed MAX_OUTPUT_TOKENS valve - now always respects requested max_tokens up to model limit
 - Simplified token calculation logic
@@ -115,7 +118,7 @@ from anthropic import (
 )
 import json
 import inspect
-
+from typing import Literal
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -314,6 +317,10 @@ class Pipe:
             le=50,
             description="Maximum number of retries for failed requests (due to rate limiting, transient errors or connection issues)",
         )
+        CACHE_CONTROL: Literal["cache disabled", "cache tools array only", "cache tools array and system promt", "cache tools array, system prompt and messages"] = Field(
+            default="cache disabled",
+            description="Cache control scope for prompts",
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging to see requests and responses",
@@ -470,9 +477,9 @@ class Pipe:
                     block["text"] = cleaned_text
                     
                     # Only add non-empty blocks to system
-                    if cleaned_text:
+                    if cleaned_text and self.valves.CACHE_CONTROL != "cache disabled" and self.valves.CACHE_CONTROL != "cache tools array only":
                         block["cache_control"] = {"type": "ephemeral"}
-                        system_messages.append(block)
+                    system_messages.append(block)
             else:
                 # Keep all historical messages as-is (they contain context from their time)
                 processed_messages.append({"role": role, "content": processed_content})
@@ -497,7 +504,7 @@ class Pipe:
                 tools_list.append(code_exec_tool)
 
         if tools_list and len(tools_list) > 0:
-            if not disable_cache and tools_list:
+            if not disable_cache and tools_list and self.valves.CACHE_CONTROL != "cache disabled":
                 tools_list[-1]["cache_control"] = {"type": "ephemeral"}
 
         if tools_list:
@@ -541,7 +548,7 @@ class Pipe:
                     content_blocks.append(context_block)
             
             # Apply cache control to last content block
-            if content_blocks:
+            if content_blocks and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
                 last_content_block = content_blocks[-1]
                 last_content_block.setdefault("cache_control", {"type": "ephemeral"})
             payload["messages"] = processed_messages
