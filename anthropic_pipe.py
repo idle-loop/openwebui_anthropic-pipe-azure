@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.3.9
+version: 0.4.1
 license: MIT
 requirements: pydantic>=2.0.0, aiohttp>=3.8.0
 environment_variables:
@@ -32,6 +32,16 @@ Todo:
 - Connect Anthropic Memory System with OpenWebUI Memory System
 
 Changelog:
+v0.4.2
+- Added a Valve to Show Token Count in the final status message
+
+v0.4.1
+- Auto-enable native function calling when tools are present (prevents OpenWebUI's function_calling task system)
+
+v0.4.0
+- Added Task Support (sorry, I forgot). Follow Ups, Titles and Tags are now generated.
+- Fix "invalid_request_error ", when a response contains both, a server tool and a local tool use (eg. web search and a local tool).
+
 v0.3.9
 - Added fine grained cache control valve with 4 levels: disabled, tools only, tools + system prompt, tools + system prompt + user messages
 
@@ -119,6 +129,15 @@ from anthropic import (
 import json
 import inspect
 from typing import Literal
+
+# Import OpenWebUI Models for auto-enabling native function calling
+try:
+    from open_webui.models.models import Models, ModelForm
+    MODELS_AVAILABLE = True
+except ImportError:
+    Models = None
+    ModelForm = None
+    MODELS_AVAILABLE = False
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -284,6 +303,10 @@ class Pipe:
         ENABLE_1M_CONTEXT: bool = Field(
             default=False,
             description="Enable 1M token context window for Claude Sonnet 4 (requires Tier 4 API access)",
+        )
+        SHOW_TOKEN_COUNT: bool = Field(
+            default=False,
+            description="Show token count for the current conversation",
         )
         WEB_SEARCH: bool = Field(
             default=True,
@@ -700,6 +723,8 @@ class Pipe:
         __metadata__: dict[str, Any] = {},
         __tools__: Optional[Dict[str, Dict[str, Any]]] = None,
         __files__: Optional[Dict[str, Any]] = None,
+        __task__: Optional[dict[str, Any]] = None,
+        __task_body__: Optional[dict[str, Any]] = None,
     ):
         """
         OpenWebUI Claude streaming pipe with integrated streaming logic.
@@ -721,8 +746,52 @@ class Pipe:
             return error_msg
 
         try:
+            # STEP 1: Detect if task model (generate title, tags, follow-ups etc.), handle it separately
+            if __task__:
+                if self.valves.DEBUG:
+                    print(f"[DEBUG] Detected task model: {__task__}")
+                return await self._run_task_model_request(body, __event_emitter__)
+            
+            # STEP 2: Await tools if needed
             if inspect.isawaitable(__tools__):
                 __tools__ = await __tools__
+            
+            # STEP 3: Auto-enable native function calling if tools are present
+            # This prevents OpenWebUI's function_calling task system from being triggered
+            if __tools__ and MODELS_AVAILABLE:
+                try:
+                    # Get the OpenWebUI model ID from metadata
+                    openwebui_model_id = __metadata__.get("model_id") if __metadata__ else None
+                    if not openwebui_model_id and body and "model" in body:
+                        openwebui_model_id = body["model"]
+                    
+                    if openwebui_model_id:
+                        model = Models.get_model_by_id(openwebui_model_id)
+                        if model:
+                            params = dict(model.params or {})
+                            if params.get("function_calling") != "native":
+                                if self.valves.DEBUG:
+                                    print(f"[DEBUG] Auto-enabling native function calling for model: {openwebui_model_id}")
+                                
+                                # Notify user
+                                await __event_emitter__(
+                                    {
+                                        "type": "notification",
+                                        "data": {
+                                            "type": "info",
+                                            "content": f"Enabling native function calling for model: {openwebui_model_id}. Please re-run your query."
+                                        }
+                                    }
+                                )
+                                
+                                params["function_calling"] = "native"
+                                form_data = model.model_dump()
+                                form_data["params"] = params
+                                Models.update_model_by_id(openwebui_model_id, ModelForm(**form_data))
+                except Exception as e:
+                    if self.valves.DEBUG:
+                        print(f"[DEBUG] Could not auto-enable native function calling: {e}")
+                    # Continue anyway - this is not critical
 
             payload, headers = await self._create_payload(
                 body, __metadata__, __user__, __tools__, __event_emitter__, __files__
@@ -753,6 +822,7 @@ class Pipe:
             citation_counter = 0  # Track citation numbers for inline citations
             citations_list = []  # Store citations for reference list
             retry_attempts = 0
+            usage_data = {}
             await __event_emitter__(
             {
                 "type": "status",
@@ -813,9 +883,10 @@ class Pipe:
                                                 f"[DEBUG] Usage stats: input={input_tokens}, output={output_tokens}, cache_creation={cache_creation_input_tokens}, cache_read={cache_read_input_tokens}"
                                             )
                                         
+                                        # Normalize usage keys to snake_case (avoid space variants)
                                         usage_data = {
-                                            "input tokens": input_tokens,
-                                            "output tokens": output_tokens,
+                                            "input_tokens": input_tokens,
+                                            "output_tokens": output_tokens,
                                             "total_tokens": input_tokens + output_tokens,
                                             "cache_creation_input_tokens": cache_creation_input_tokens,
                                             "cache_read_input_tokens": cache_read_input_tokens,
@@ -865,6 +936,14 @@ class Pipe:
                                     )
 
                                 if content_type == "server_tool_use":
+                                    # Reset tools_buffer for server tools (web_search, code_execution)
+                                    tools_buffer = (
+                                        "{"
+                                        f'"type": "tool_use", '
+                                        f'"id": "{content_block.id}", '
+                                        f'"name": "{content_block.name}", '
+                                        f'"input": '
+                                    )
                                     name = getattr(content_block, "name", "")
                                     if name == "code_execution":
                                         await __event_emitter__(
@@ -1232,16 +1311,27 @@ class Pipe:
                                 {"type": "text", "text": chunk}
                             )
 
-                        # Add tool_use blocks to assistant message
+                        # Add tool_use blocks to assistant message (ONLY client-side tools)
+                        # Server-side tools (web_search, code_execution) are executed by Anthropic
+                        # and don't need tool_use/tool_result blocks in subsequent messages
                         for tool_call_json in tool_calls:
                             try:
                                 tool_call_data = json.loads(
                                     self._finalize_tool_buffer(tool_call_json)
                                 )
+                                tool_id = tool_call_data.get("id", "")
+                                tool_name = tool_call_data.get("name", "")
+                                
+                                # Skip server-side tools - they're already handled in the stream
+                                if tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]:
+                                    if self.valves.DEBUG:
+                                        print(f"🔧 [DEBUG] Skipping server-side tool {tool_name} (ID: {tool_id}) in assistant message")
+                                    continue
+                                
                                 tool_use_block = {
                                     "type": "tool_use",
-                                    "id": tool_call_data.get("id", ""),
-                                    "name": tool_call_data.get("name", ""),
+                                    "id": tool_id,
+                                    "name": tool_name,
                                     "input": tool_call_data.get("input", {}),
                                 }
                                 assistant_content.append(tool_use_block)
@@ -1389,14 +1479,133 @@ class Pipe:
                     )
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
+        # Preserve existing generated content; append completion marker
+        final_status = "✅ Response processing complete."
+        if self.valves.SHOW_TOKEN_COUNT and usage_data:
+            # Safely extract tokens
+            input_tokens = usage_data.get("input_tokens", 0)
+            output_tokens = usage_data.get("output_tokens", 0)
+            cache_read_input_tokens = usage_data.get("cache_read_input_tokens", 0)
+            cache_creation_input_tokens = usage_data.get("cache_creation_input_tokens", 0)
+            total_tokens = input_tokens + output_tokens + cache_read_input_tokens + cache_creation_input_tokens
+            usage_data["total_tokens"] = total_tokens  # ensure consistency
+
+            # Percentage of assumed 200k context window (Claude 3.5 Sonnet extended)
+            percentage = min((total_tokens / 200000) * 100, 100)
+
+            # Progress bar (10 segments)
+            filled = int(percentage / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+
+            def format_num(n: int) -> str:
+                if n >= 1_000_000:
+                    return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:
+                    return f"{n/1_000:.1f}K"
+                return str(n)
+
+            final_status += f" [{bar}] {format_num(total_tokens)}/200k ({percentage:.1f}%)"
+
         await __event_emitter__({
                             "type": "status",
                             "data": {
-                                "description": "✅ Response processing complete.",
+                                "description": final_status,
                                 "done": True,
                             }
                         })
         return final_message
+
+    async def _run_task_model_request(
+        self,
+        body: dict[str, Any],
+        __event_emitter__: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """
+        Handle task model requests (title generation, tags, follow-ups etc.) by making a
+        non-streaming request to Anthropic API and returning only the text response.
+        
+        Task models should return plain text without any JSON formatting or status updates
+        mixed into the response.
+        """
+        try:
+            # Extract model and messages from body
+            actual_model_name = body["model"].split("/")[-1]
+            messages = body.get("messages", [])
+            
+            # Build simple payload for task request (non-streaming)
+            task_payload = {
+                "model": actual_model_name,
+                "max_tokens": body.get("max_tokens", 4096),
+                "messages": self._process_messages_for_task(messages),
+                "stream": False,
+            }
+            
+            # Add system message if present
+            system_messages = [msg for msg in messages if msg.get("role") == "system"]
+            if system_messages:
+                task_payload["system"] = [
+                    {"type": "text", "text": msg.get("content", "")}
+                    for msg in system_messages
+                ]
+            
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task payload: {json.dumps(task_payload, indent=2)}")
+            
+            # Make synchronous request to Anthropic API
+            api_key = self.valves.ANTHROPIC_API_KEY
+            client = AsyncAnthropic(api_key=api_key)
+            
+            response = await client.messages.create(**task_payload)
+            
+            # Extract text from response
+            text_parts = []
+            for content_block in response.content:
+                if content_block.type == "text":
+                    text_parts.append(content_block.text)
+            
+            result = "".join(text_parts)
+            
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task response: {result}")
+            
+            return result
+            
+        except Exception as e:
+            if self.valves.DEBUG:
+                print(f"[DEBUG] Task model error: {e}")
+            await self.handle_errors(e, __event_emitter__)
+            return ""
+    
+    def _process_messages_for_task(self, messages: List[dict]) -> List[dict]:
+        """
+        Process messages for task requests - convert to simple Anthropic format.
+        Task requests don't need complex content processing.
+        """
+        processed = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                continue  # System messages handled separately
+            
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                processed.append({
+                    "role": role,
+                    "content": content
+                })
+            elif isinstance(content, list):
+                # Extract text from content blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                if text_parts:
+                    processed.append({
+                        "role": role,
+                        "content": " ".join(text_parts)
+                    })
+        
+        return processed
 
     async def handle_errors(self, exception, __event_emitter__):
         # Determine specific error message based on exception type
@@ -1516,18 +1725,20 @@ class Pipe:
             # Parse the JSON string to get tool call data
             try:
                 tool_call_data = json.loads(fc_item)
-                tool_type = tool_call_data.get("type", "")
-                if tool_type == "server_tool_use":
-                    if self.valves.DEBUG:
-                        print(f"🔧 [DEBUG] Parsed tool call is Server sided - Skipping")
-                    continue
+                tool_id = tool_call_data.get("id", "")
                 tool_name = tool_call_data.get("name", "")
+                
+                # Skip server-side tools (executed by Anthropic, not by us)
+                # Server tools have ID prefix "srvtoolu_" or are known server tool names
+                if tool_id.startswith("srvtoolu_") or tool_name in ["web_search", "code_execution"]:
+                    if self.valves.DEBUG:
+                        print(f"🔧 [DEBUG] Skipping server-side tool: {tool_name} (ID: {tool_id})")
+                    continue
                 # if tool_name == "memory":
                 #     # Handle Memory Tool Calls
                 #     await self.handle_memory_call(tool_call_data, __event_emitter__)
                 #     continue
                 tool_input = tool_call_data.get("input", {})
-                tool_id = tool_call_data.get("id", "")
                 tool_call_data_list.append(tool_call_data)
 
                 if self.valves.DEBUG:
