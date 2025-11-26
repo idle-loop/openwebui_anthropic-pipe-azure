@@ -152,7 +152,7 @@ Install directly from the Open WebUI community:
 | `cache tools array and system prompt` | Cache tools + system prompt |
 | `cache tools array, system prompt and messages` | Full caching (recommended) |
 
-> 💡 **Pro Tip**: The full caching mode intelligently handles OpenWebUI's Memory and RAG systems by extracting dynamic content from the system prompt and placing it in user messages. This preserves cache efficiency while maintaining functionality – saving money and improving speed!
+> 💡 **RAG & MEMORY**: The Pipe intelligently tries to extract Memories and RAG Content from the System Promt and puts it in the last User Message. While this is drasticly saving money and improving speed there maybe some problems with other filters or the models using the Knowledge or Memories wrong. Please open an issue if you have problems.
 
 ### UserValves (Per-User Settings)
 
