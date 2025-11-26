@@ -405,7 +405,7 @@ class Pipe:
             description="Maximum number of retries for failed requests (due to rate limiting, transient errors or connection issues)",
         )
         CACHE_CONTROL: Literal["cache disabled", "cache tools array only", "cache tools array and system prompt", "cache tools array, system prompt and messages"] = Field(
-            default="cache disabled",
+            default="cache tools array, system prompt and messages",
             description="Cache control scope for prompts",
         )
         WEB_SEARCH_USER_CITY: str = Field(
