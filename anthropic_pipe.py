@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.5
+version: 0.5.6
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -17,7 +17,7 @@ Supports:
 - citations for web_search
 - Streaming responses
 - Prompt caching (server-side) compatible with Openwebui Memory and RAG System
-- Promt Caching of System Promts, Messages- and Tools Array (controllable via Valve)
+- Prompt Caching of System Prompts, Messages- and Tools Array (controllable via Valve)
 - Comprehensive error
 - Image processing
 - Web_Search Toggle Action
@@ -25,12 +25,19 @@ Supports:
 - Extended Thinking Toggle Action
 - Code Execution Tool
 - Vision
+- Context Editing (clear tool results and thinking blocks)
+- Tool Search (BM25/Regex)
 
 
 Changelog:
+v0.5.6
+- Added Context Editing feature (clear_tool_uses, clear_thinking) with configurable strategies
+- Added Tool Search feature (BM25/Regex) with deferred tool loading
+- Status events for context clearing with token counts
+- Warning notification for thinking+cache conflict
+
 v0.5.5
 - Fixed effort parameter support by upgrading Anthropic SDK from 0.60.0 to 0.75.0
-- Re-enabled effort levels for Opus 4.5
 
 v0.5.4
 - Fixed Message Caching Problems when using RAG or Memories
@@ -227,6 +234,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-3-sonnet-20240229": {
             "max_tokens": 4096,
@@ -236,6 +244,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-3-haiku-20240307": {
             "max_tokens": 4096,
@@ -245,6 +254,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         # Claude 3.5 family
         "claude-3-5-sonnet-20240620": {
@@ -255,6 +265,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-3-5-sonnet-20241022": {
             "max_tokens": 8192,
@@ -264,6 +275,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-3-5-haiku-20241022": {
             "max_tokens": 8192,
@@ -273,6 +285,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         # Claude 3.7 family
         "claude-3-7-sonnet-20250219": {
@@ -283,6 +296,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         # Claude 4 family
         "claude-sonnet-4-20250514": {
@@ -293,6 +307,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-opus-4-20250514": {
             "max_tokens": 32000,
@@ -302,6 +317,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-opus-4-1-20250805": {
             "max_tokens": 32000,
@@ -311,6 +327,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         },
         "claude-sonnet-4-5-20250929": {
             "max_tokens": 64000,
@@ -320,6 +337,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": True,
         },
         "claude-haiku-4-5-20251001": {
             "max_tokens": 64000,
@@ -329,6 +347,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,  # Haiku 4.5 only supports allowed_callers=['direct']
         },
         "claude-opus-4-5-20251101": {
             "max_tokens": 64000,
@@ -338,6 +357,7 @@ class Pipe:
             "supports_memory": True,
             "supports_vision": True,
             "supports_effort": True,
+            "supports_programmatic_calling": True,
         }
     }
     
@@ -380,6 +400,7 @@ class Pipe:
             "supports_memory": False,
             "supports_vision": True,
             "supports_effort": False,
+            "supports_programmatic_calling": False,
         })
 
     class Valves(BaseModel):
@@ -427,6 +448,61 @@ class Pipe:
         WEB_SEARCH_USER_TIMEZONE: str = Field(
             default="",
             description="User's timezone for web search.",
+        )
+        # # Programmatic Tool Calling
+        # ENABLE_PROGRAMMATIC_TOOL_CALLING: bool = Field(
+        #     default=False,
+        #     description="Enable programmatic tool calling. Claude can call tools from within code execution.",
+        # )
+        # Tool Search
+        ENABLE_TOOL_SEARCH: bool = Field(
+            default=False,
+            description="Enable tool search. Allows Claude to search for tools by name/description when many tools are available.",
+        )
+        TOOL_SEARCH_TYPE: Literal["regex", "bm25"] = Field(
+            default="bm25",
+            description="Type of tool search: 'regex' for pattern matching or 'bm25' for natural language search.",
+        )
+        TOOL_SEARCH_MAX_DESCRIPTION_LENGTH: int = Field(
+            default=100,
+            ge=10,
+            le=10000,
+            description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
+        )
+        # Context Editing
+        CONTEXT_EDITING_STRATEGY: Literal["none", "clear_tool_results", "clear_thinking", "clear_both"] = Field(
+            default="none",
+            description="Context editing strategy: none (disabled), clear_tool_results, clear_thinking, or clear_both.",
+        )
+        # Thinking block clearing parameters
+        CONTEXT_EDITING_THINKING_KEEP: int = Field(
+            default=5,
+            ge=0,
+            le=9999,
+            description="How many thinking blocks to keep",
+        )
+        # Tool result clearing parameters
+        CONTEXT_EDITING_TOOL_TRIGGER: int = Field(
+            default=50000,
+            ge=1000,
+            le=500000,
+            description="Token count threshold that triggers tool result clearing.",
+        )
+        CONTEXT_EDITING_TOOL_KEEP: int = Field(
+            default=5,
+            ge=0,
+            le=100,
+            description="Number of recent tool results to preserve when clearing.",
+        )
+        CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST: int = Field(
+            default=10000,
+            ge=0,
+            le=100000,
+            description="Minimum tokens to clear when triggered (helps with cache optimization).",
+        )
+        CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT: bool = Field(
+            default=False,
+            description="Also clear tool input parameters when clearing tool results.",
         )
 
     class UserValves(BaseModel):
@@ -476,6 +552,9 @@ class Pipe:
         self.id = "anthropic"
         self.valves = self.Valves()
         self.logger = logger
+        # Track if we've warned about thinking+cache conflict per chat_id
+        self._warned_thinking_cache_conflict: set = set()
+        
     async def get_anthropic_models(self) -> List[dict]:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
@@ -707,14 +786,37 @@ class Pipe:
         if not processed_messages:
             raise ValueError("No valid messages to process")
 
+        # Check feature flags
+        enable_programmatic_calling = self.valves.ENABLE_PROGRAMMATIC_TOOL_CALLING
+        enable_tool_search = self.valves.ENABLE_TOOL_SEARCH
+        tool_search_type = self.valves.TOOL_SEARCH_TYPE
+        max_tool_description_length = self.valves.TOOL_SEARCH_MAX_DESCRIPTION_LENGTH
+
         # Correct Order for Caching: Tools, System, Messages
-        tools_list = self._convert_tools_to_claude_format(__tools__, actual_model_name, __user__)
+        tools_list = self._convert_tools_to_claude_format(
+            __tools__, actual_model_name, __user__,
+            enable_programmatic_calling=enable_programmatic_calling,
+            enable_tool_search=enable_tool_search,
+            max_tool_description_length=max_tool_description_length
+        )
+        
         # Decide on code execution inclusion early so we can set beta headers later
         activate_code_execution = __metadata__.get(
             "activate_code_execution_tool", False
         )
-        # Append code execution tool (no parameters) if enabled
-        if activate_code_execution:
+        
+        # Programmatic tool calling uses code_execution_20250825 (newer version)
+        if enable_programmatic_calling:
+            code_exec_tool = {
+                "type": "code_execution_20250825",
+                "name": "code_execution",
+            }
+            # Avoid duplicates if already added
+            if not any(t.get("name") == "code_execution" for t in tools_list):
+                tools_list.insert(0, code_exec_tool)  # Insert at beginning
+
+        # Regular code execution toggle (older version)
+        elif activate_code_execution:
             code_exec_tool = {
                 "type": "code_execution_20250522",
                 "name": "code_execution",
@@ -722,13 +824,41 @@ class Pipe:
             # Avoid duplicates if already added
             if not any(t.get("name") == "code_execution" for t in tools_list):
                 tools_list.append(code_exec_tool)
+        
+        # Add tool search tool if enabled
+        if enable_tool_search:
+            # Determine the tool search type
+            if tool_search_type == "regex":
+                tool_search_tool = {
+                    "type": "tool_search_tool_regex_20251119",
+                    "name": "tool_search_tool_regex",
+                }
+            else:  # bm25 (default)
+                tool_search_tool = {
+                    "type": "tool_search_tool_bm25_20251119",
+                    "name": "tool_search_tool_bm25",
+                }
+            
+            # Add tool search tool at the beginning so Claude sees it first
+            if not any(t.get("name") == "tool_search" for t in tools_list):
+                tools_list.insert(0, tool_search_tool)
 
         if tools_list and len(tools_list) > 0:
             # Add cache control to last tool when caching tools (alone or with system)
             # "cache tools only" = cache breakpoint at tools
             # "cache tools and system" = cache breakpoint at tools AND system (hierarchical)
+            # Don't add cache_control to deferred tools (incompatible with defer_loading)
             if self.valves.CACHE_CONTROL in ["cache tools array only", "cache tools array and system prompt"]:
-                tools_list[-1]["cache_control"] = {"type": "ephemeral"}
+                last_tool = tools_list[-1]
+                # Only add cache_control if tool doesn't have defer_loading
+                if not last_tool.get("defer_loading", False):
+                    last_tool["cache_control"] = {"type": "ephemeral"}
+                else:
+                    # Find the last non-deferred tool to add cache_control
+                    for i in range(len(tools_list) - 1, -1, -1):
+                        if not tools_list[i].get("defer_loading", False):
+                            tools_list[i]["cache_control"] = {"type": "ephemeral"}
+                            break
 
         if tools_list:
             # Check for enforced web search or code execution in metadata (precedence: specific enforcement first)
@@ -812,6 +942,70 @@ class Pipe:
         # Add code execution beta if valve or metadata enforcement active
         if activate_code_execution:
             beta_headers.append("code-execution-2025-05-22")
+        
+        # Add advanced tool use beta (for programmatic calling and tool search)
+        if enable_programmatic_calling or enable_tool_search:
+            beta_headers.append("advanced-tool-use-2025-11-20")
+        
+        # Add context editing strategies if enabled
+        context_editing_strategy = self.valves.CONTEXT_EDITING_STRATEGY
+        if context_editing_strategy != "none":
+            beta_headers.append("context-management-2025-06-27")
+            
+            # Build context_management array for payload
+            # IMPORTANT: clear_thinking must be FIRST if present (API requirement)
+            context_management = []
+            
+            # Add clear_thinking FIRST if needed
+            if context_editing_strategy in ["clear_thinking", "clear_both"] and should_enable_thinking and model_info["supports_thinking"]:
+                clear_thinking = {
+                    "type": "clear_thinking_20251015",
+                    "keep": {
+                        "type": "thinking_turns",
+                        "value": self.valves.CONTEXT_EDITING_THINKING_KEEP,
+                    }
+                }
+                context_management.append(clear_thinking)
+            
+            # Add clear_tool_uses SECOND
+            if context_editing_strategy in ["clear_tool_results", "clear_both"] and len(tools_list) > 2:
+                clear_tool_uses = {
+                    "type": "clear_tool_uses_20250919",
+                    "trigger": {
+                        "type": "input_tokens",
+                        "value": self.valves.CONTEXT_EDITING_TOOL_TRIGGER
+                    },
+                    "keep": {
+                        "type": "tool_uses",
+                        "value": self.valves.CONTEXT_EDITING_TOOL_KEEP
+                    },
+                }
+                if self.valves.CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST > 0:
+                    clear_tool_uses["clear_at_least"] = {
+                        "type": "input_tokens",
+                        "value": self.valves.CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST
+                    }
+                if self.valves.CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT:
+                    clear_tool_uses["clear_tool_inputs"] = True
+                context_management.append(clear_tool_uses)
+                
+                # Check for thinking + cache conflict and warn once per conversation
+            if context_editing_strategy in ["clear_thinking", "clear_both"] and self.valves.CACHE_CONTROL == "cache tools array, system prompt and messages":
+                chat_id = __metadata__.get("chat_id", "")
+                if chat_id and chat_id not in self._warned_thinking_cache_conflict:
+                    self._warned_thinking_cache_conflict.add(chat_id)
+                    await self.emit_event( 
+                        {
+                            "type": "notification",
+                            "data": {
+                                "type": "warning",
+                                "content": "⚠️ Thinking block clearing is enabled with message caching. This may invalidate cached content when thinking blocks are cleared.",
+                            },
+                        },
+                        __event_emitter__,
+                    )
+            if context_management:
+                payload["context_management"] = {"edits": context_management}
 
         # Add 1M context header if enabled and model supports it
         if self.valves.ENABLE_1M_CONTEXT and model_info["supports_1m_context"]:
@@ -832,18 +1026,25 @@ class Pipe:
         
         return payload, headers
 
-    def _convert_tools_to_claude_format(self, __tools__, actual_model_name: str, __user__: Dict[str, Any]) -> List[dict]:
+    def _convert_tools_to_claude_format(self, __tools__, actual_model_name: str, __user__: Dict[str, Any], 
+                                         enable_programmatic_calling: bool = False, 
+                                         enable_tool_search: bool = False,
+                                         max_tool_description_length: int = 100) -> List[dict]:
         """
         Convert OpenWebUI tools format to Claude API format.
         Args:
             __tools__: Dict of tools from OpenWebUI
             actual_model_name: Model name for capability checking
             __user__: User dict for valve overrides
+            enable_programmatic_calling: If True, add allowed_callers to tools
+            enable_tool_search: If True, defer tools with long descriptions
+            max_tool_description_length: Max length before deferring a tool
         Returns:
             list: Tools in Claude API format
         """
         claude_tools = []
         tool_names_seen = set()  # Track unique tool names
+        deferred_tools_count = 0
 
         if __tools__:
             try:
@@ -937,9 +1138,32 @@ class Pipe:
                 "description": description,
                 "input_schema": input_schema,
             }
+            
+            # Add allowed_callers for programmatic tool calling (only if model supports it)
+            # When enabled, tools can ONLY be called from code execution, not directly by Claude
+            # This enables Claude to write code that calls tools programmatically for:
+            # - Large data processing (filter/aggregate before returning to context)
+            # - Multi-step workflows (save tokens by chaining tool calls in code)
+            # - Conditional logic based on intermediate results
+            if enable_programmatic_calling:
+                model_info = self.get_model_info(actual_model_name)
+                if model_info.get("supports_programmatic_calling", False):
+                    claude_tool["allowed_callers"] = ["code_execution_20250825"]
+            
+            # Check if tool should be deferred for tool search
+            if enable_tool_search:
+                # Calculate tool definition size (JSON representation)
+                tool_json = json.dumps(claude_tool)
+                if len(tool_json) > max_tool_description_length:
+                    claude_tool["defer_loading"] = True
+                    deferred_tools_count += 1
+                    logger.debug(f"Tool '{name}' deferred (size: {len(tool_json)} > {max_tool_description_length})")
+            
             claude_tools.append(claude_tool)
             tool_names_seen.add(name)
 
+        if deferred_tools_count > 0:
+            logger.debug(f"Deferred {deferred_tools_count} tools for tool search")
 
         logger.debug(f"Total tools converted: {len(claude_tools)}")
 
@@ -1248,6 +1472,16 @@ class Pipe:
                                                 },
                                             }
                                         )
+                                    elif active_server_tool_name in ["tool_search_tool_regex", "tool_search_tool_bm25"]:
+                                        await emit_event_local(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": "🔍 Searching for tools...",
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
 
                                 if content_type == "code_execution_tool_result":
                                     result_block = getattr(
@@ -1309,6 +1543,79 @@ class Pipe:
                                                     },
                                                 }
                                             )
+                                
+                                # Handle tool search results (only if tool search is enabled)
+                                if content_type == "tool_search_tool_result":
+                                    logger.debug(f" Processing tool search result event: {event}")
+                                    # Only show status events if tool search valve is enabled
+                                    if self.valves.ENABLE_TOOL_SEARCH:
+                                        # Access nested structure: content_block.content.tool_references
+                                        content = getattr(content_block, "content", None)
+                                        tool_references = []
+                                        if content:
+                                            # Handle both dict and object access patterns
+                                            if hasattr(content, "tool_references"):
+                                                tool_references = getattr(content, "tool_references", [])
+                                            elif isinstance(content, dict):
+                                                tool_references = content.get("tool_references", [])
+                                        
+                                        logger.debug(f"Tool search result - found {len(tool_references)} tool references")
+                                        
+                                        if tool_references and len(tool_references) > 0:
+                                            # Extract tool names from references
+                                            tool_names = []
+                                            for ref in tool_references[:5]:
+                                                if hasattr(ref, "tool_name"):
+                                                    tool_names.append(getattr(ref, "tool_name", "unknown"))
+                                                elif isinstance(ref, dict):
+                                                    tool_names.append(ref.get("tool_name", "unknown"))
+                                            
+                                            status_desc = f"🔍 Found {len(tool_references)} tool(s): {', '.join(tool_names)}"
+                                            logger.debug(f"Tool search success: {status_desc}")
+                                            await emit_event_local(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": status_desc,
+                                                        "done": True,
+                                                    },
+                                                }
+                                            )
+                                        else:
+                                            logger.debug("Tool search returned no results")
+                                            await emit_event_local(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "🔍 Tool search: No matching tools found",
+                                                        "done": True,
+                                                    },
+                                                }
+                                            )
+                                
+                                # Handle context cleared events
+                                if content_type == "context_cleared":
+                                    cleared_info = getattr(content_block, "cleared", {})
+                                    cleared_type = getattr(cleared_info, "type", "unknown") if hasattr(cleared_info, "type") else cleared_info.get("type", "unknown")
+                                    cleared_tokens = getattr(cleared_info, "tokens_cleared", 0) if hasattr(cleared_info, "tokens_cleared") else cleared_info.get("tokens_cleared", 0)
+                                    
+                                    if cleared_type == "tool_uses":
+                                        status_desc = f"🧹 Cleared tool results: ~{cleared_tokens:,} tokens removed"
+                                    elif cleared_type == "thinking":
+                                        status_desc = f"🧹 Cleared thinking blocks: ~{cleared_tokens:,} tokens removed"
+                                    else:
+                                        status_desc = f"🧹 Context cleared: ~{cleared_tokens:,} tokens removed"
+                                    
+                                    await emit_event_local(
+                                        {
+                                            "type": "status",
+                                            "data": {
+                                                "description": status_desc,
+                                                "done": True,
+                                            },
+                                        }
+                                    )
+                                    logger.debug(f"Context cleared: type={cleared_type}, tokens={cleared_tokens}")
 
                             elif event_type == "content_block_delta":
                                 delta = getattr(event, "delta", None)
@@ -1379,6 +1686,26 @@ class Pipe:
                                             elif active_server_tool_name == "code_execution":
                                                 # Code execution input - just log it
                                                 logger.debug(f"Code execution input: {server_tool_input_buffer[:100]}...")
+                                            elif active_server_tool_name == "tool_search":
+                                                # Tool search input - extract and show query
+                                                try:
+                                                    parsed = json.loads(server_tool_input_buffer)
+                                                    if 'query' in parsed:
+                                                        search_query = parsed['query']
+                                                        logger.debug(f"Tool search query: '{search_query}'")
+                                                        await emit_event_local(
+                                                            {
+                                                                "type": "status",
+                                                                "data": {
+                                                                    "description": f"🔍 Tool search: {search_query}",
+                                                                    "done": False,
+                                                                },
+                                                            }
+                                                        )
+                                                except json.JSONDecodeError:
+                                                    logger.debug(f"Partial tool_search JSON: {server_tool_input_buffer}")
+                                                except Exception as e:
+                                                    logger.debug(f"Tool search query extraction error: {e}")
                                         else:
                                             # Client-side tool - accumulate in tools_buffer
                                             tools_buffer += partial
