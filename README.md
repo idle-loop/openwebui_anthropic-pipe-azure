@@ -6,7 +6,7 @@
 
 ## 📖 Overview
 
-An advanced Anthropic API integration for Open WebUI that enables Claude models to orchestrate complex multi-tool workflows. Handle sophisticated tasks like: *"Grab my Jira Issues for this week and send me a summary on slack!"* – all in a single request with parallel and sequential tool calling.
+An advanced Anthropic API integration for Open WebUI that enables Claude models to orchestrate complex multi-tool workflows. Handle sophisticated tasks like *"Grab my Jira Issues for this week and send me a summary on slack!"* – all in a single request with parallel and sequential tool calling. Features tool search for large toolsets, automatic context management, and experimental PDF native upload.
 
 ### 🎯 Key Highlights
 
@@ -15,10 +15,12 @@ An advanced Anthropic API integration for Open WebUI that enables Claude models 
 | 🔄 **Multi-Tool Loop** | Call multiple tools iteratively in the same response |
 | ⚡ **Parallel Execution** | Execute independent tools simultaneously for performance |
 | 💾 **Prompt Caching** | Automatic caching for system prompts, tools, and messages, compatible with openwebui RAG and Memory System |
-| 🧠 **Extended Thinking** | Toggle Claude's reasoning on and off mir-conversation |
+| 🧠 **Extended Thinking** | Toggle Claude's reasoning on and off per-conversation |
 | 👁️ **Vision Support** | Process images with Claude |
 | 💻 **Code Execution** | Sandboxed Python execution via Anthropic tool |
 | 🔍 **Web Search** | Built-in search with inline citations |
+| 🔍 **Tool Search** | BM25/Regex search for tools with deferred loading |
+| 🧹 **Context Editing** | Auto-clear tool results and thinking blocks |
 | 📊 **1M Token Context** | Extended context for Claude Sonnet 4 and 4.5 |
 
 ---
@@ -42,7 +44,12 @@ An advanced Anthropic API integration for Open WebUI that enables Claude models 
 | Feature | Description |
 |---------|-------------|
 | **Image Processing/Vision** | Process and analyze images (JPEG, PNG, GIF, WebP) |
-| **Extended Thinking** | Controllable via valve and toggle filter |
+| **PDF Native Upload** | ⚠️ EXPERIMENTAL: Attach PDFs as base64 to first message |
+| **Tool Search** | 🔍 BM25/Regex search for tools with deferred loading to handle large toolsets |
+| **Context Editing** | 🧹 Automatic clearing of old tool results and thinking blocks to manage context window |
+| **Code Execution** | 💻 Sandboxed Python environment with result formatting and error handling |
+| **Web Search** | 🌐 Built-in search with inline citations `[1]` and source references |
+| **Extended Thinking** | 🧠 Controllable reasoning mode via valve and toggle filter |
 | **Effort Levels** | Configurable effort (`low`, `medium`, `high`) for Opus 4.5 |
 | **Web Search Tool** | With inline citations `[1]` and source references |
 | **Code Execution** | Sandboxed Python environment with result formatting |
@@ -63,7 +70,12 @@ An advanced Anthropic API integration for Open WebUI that enables Claude models 
 
 | Status | Feature | Notes |
 |--------|---------|-------|
-| 📌 | **PDF Processing** | Base64 inline in messages instead of RAG extraction
+| ✅ | **PDF Processing** | ✅ IMPLEMENTED: Base64 inline in messages instead of RAG extraction |
+| ✅ | **Tool Search** | ✅ IMPLEMENTED: BM25/Regex search with deferred tool loading |
+| ✅ | **Context Editing** | ✅ IMPLEMENTED: Auto-clear tool results and thinking blocks |
+| ✅ | **Code Execution** | ✅ IMPLEMENTED: Sandboxed Python environment |
+| ✅ | **Web Search** | ✅ IMPLEMENTED: Built-in search with citations |
+| ✅ | **Extended Thinking** | ✅ IMPLEMENTED: Toggle filter for thinking mode |
 | 📌 | **Files API** integration | For native file handling with Code Execution |
 | 📌 | **UserValves API Key** support | Per-user API keys |
 | 📌 | **Claude Skills** | Implement Usage of Skills |
@@ -118,6 +130,16 @@ Install directly from the Open WebUI community:
 | `MAX_RETRIES` | `3` | Maximum retries for failed requests (0-50) |
 | `CACHE_CONTROL` | `disabled` | Prompt caching scope (see below) |
 | `WEB_SEARCH_USER_*` | - | Default location for web searches (city, region, country, timezone) |
+| `ENABLE_TOOL_SEARCH` | `false` | Enable tool search. Allows Claude to search for tools by name/description when many tools are available. |
+| `TOOL_SEARCH_TYPE` | `bm25` | Type of tool search: 'regex' for pattern matching or 'bm25' for natural language search. |
+| `TOOL_SEARCH_MAX_DESCRIPTION_LENGTH` | `100` | Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading. |
+| `TOOL_SEARCH_EXCLUDE_TOOLS` | `["web_search", "code_execution_20250825"]` | Tools to exclude from defer_loading when tool search is enabled. These tools will always be loaded immediately. |
+| `CONTEXT_EDITING_STRATEGY` | `none` | Context editing strategy: none (disabled), clear_tool_results, clear_thinking, or clear_both. |
+| `CONTEXT_EDITING_THINKING_KEEP` | `5` | How many thinking blocks to keep when clearing thinking. |
+| `CONTEXT_EDITING_TOOL_TRIGGER` | `50000` | Token count threshold that triggers tool result clearing. |
+| `CONTEXT_EDITING_TOOL_KEEP` | `5` | Number of recent tool results to preserve when clearing. |
+| `CONTEXT_EDITING_TOOL_CLEAR_AT_LEAST` | `10000` | Minimum tokens to clear when triggered (helps with cache optimization). |
+| `CONTEXT_EDITING_TOOL_CLEAR_TOOL_INPUT` | `false` | Also clear tool input parameters when clearing tool results. |
 
 #### Cache Control Options
 
@@ -137,6 +159,7 @@ Install directly from the Open WebUI community:
 | `ENABLE_THINKING` | `false` | - | Enable Extended Thinking mode |
 | `THINKING_BUDGET_TOKENS` | `4096` | 0-32000 | Token budget for thinking |
 | `EFFORT` | `high` | low/medium/high | Effort level for Opus 4.5 |
+| `USE_PDF_NATIVE_UPLOAD` | `false` | - | ⚠️ EXPERIMENTAL: Attach PDFs as base64 instead of RAG |
 | `SHOW_TOKEN_COUNT` | `false` | - | Show context window progress bar |
 | `WEB_SEARCH_MAX_USES` | `5` | 1-20 | Max searches per request |
 | `WEB_SEARCH_USER_*` | - | - | Override global location settings |
@@ -153,7 +176,30 @@ Install directly from the Open WebUI community:
 
 ## 📝 Changelog
 
-### v0.5.4 (Latest)
+### v0.5.9 (Latest) ⚠️ EXPERIMENTAL
+- ✨ Added native PDF upload support via `USE_PDF_NATIVE_UPLOAD` UserValve
+  - Attaches entire PDF as base64 to first user message for cache compatibility
+  - Anthropic parses PDF directly (charts, images, layouts) instead of RAG extraction
+  - Automatically filters duplicate RAG content for PDFs
+  - Removes entire RAG prompt if PDF is the only source (token savings)
+  - **Status**: Experimental and untested - use with caution
+
+### v0.5.8
+- 🐛 Fixed UnboundLocalError for 'total_usage' variable when opening new chats
+- ✨ Added code execution to default TOOL_SEARCH_EXCLUDE_TOOLS list
+
+### v0.5.7
+- ✨ Added Valve to exclude specific tools from deferred loading when tool search is enabled (web_search excluded by default)
+- 🌐 Web Search Toggle Filter overrides WEB_SEARCH Valve
+- 🐛 Fixed a Bug in Tool Search return
+
+### v0.5.6
+- ✨ Added Context Editing feature (clear_tool_uses, clear_thinking) with configurable strategies
+- 🔍 Added Tool Search feature (BM25/Regex) with deferred tool loading
+- 📊 Status events for context clearing with token counts
+- ⚠️ Warning notification for thinking+cache conflict
+
+### v0.5.4
 - 🐛 Fixed Message Caching Problems when using RAG or Memories
 
 ### v0.5.3
