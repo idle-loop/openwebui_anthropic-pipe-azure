@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.7
+version: 0.5.9
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -27,8 +27,16 @@ Supports:
 - Vision
 - Context Editing (clear tool results and thinking blocks)
 - Tool Search (BM25/Regex)
+- Native PDF Upload (visual PDF analysis with charts/images)
 
 Changelog:
+v0.5.9
+- PDF with 'Use Full Document Content' mode will then be uploaded as base64 documents instead of RAG text extraction, use UserValve USE_PDF_NATIVE_UPLOAD to Toggle
+
+v0.5.8
+- Fixed UnboundLocalError for 'total_usage' variable when opening new chats
+- Added code execution to default TOOL_SEARCH_EXCLUDE_TOOLS list
+
 v0.5.7
 - Added Valve to exclude specific tools from deferred loading when tool search is enabled (web_search excluded by default)
 - Web Search Toogle Filter overrides WEB_SEARCH Valve
@@ -219,6 +227,18 @@ except ImportError:
     Models = None
     ModelForm = None
     MODELS_AVAILABLE = False
+
+# Import OpenWebUI Files and Storage for PDF native upload
+try:
+    from open_webui.models.files import Files
+    from open_webui.storage.provider import Storage
+    from pathlib import Path
+    FILES_AVAILABLE = True
+except ImportError:
+    Files = None
+    Storage = None
+    Path = None
+    FILES_AVAILABLE = False
 
 class Pipe:
     API_VERSION = "2023-06-01"  # Current API version as of May 2025
@@ -483,7 +503,7 @@ class Pipe:
             description="Maximum tool description length. Tools with longer JSON definitions will be deferred for lazy loading.",
         )
         TOOL_SEARCH_EXCLUDE_TOOLS: List[str] = Field(
-           default=["web_search"],
+           default=["web_search", "code_execution_20250825"],
             description="Tools to exclude from defer_loading when tool search is enabled. These tools will always be loaded immediately.",
         )
         # Context Editing
@@ -530,14 +550,18 @@ class Pipe:
             description="Enable Extended Thinking",
         )
         THINKING_BUDGET_TOKENS: int = Field(
-            default=4096,
+            default=8192,
             ge=0,
-            le=32000,
+            le=64000,
             description="Thinking budget tokens",
         )
         EFFORT: Literal["low", "medium", "high"] = Field(
             default="high",
             description="Effort level for this user. Also Controllable with OpenWebUI's reasoning_effort parameter.",
+        )
+        USE_PDF_NATIVE_UPLOAD: bool = Field(
+            default=False,
+            description="Upload PDFs as native base64 documents instead of RAG text extraction. Enables visual PDF analysis (charts, images, layouts). Only applies to 'Use Full Document' mode.",
         )
         SHOW_TOKEN_COUNT: bool = Field(
             default=False,
@@ -565,7 +589,7 @@ class Pipe:
             default="",
             description="User's timezone for web search.",
         )
-
+    
     def __init__(self):
         self.type = "manifold"
         self.id = "anthropic"
@@ -663,6 +687,202 @@ class Pipe:
                 if "<context>" in text or ("### Task:" in text and "<source" in text):
                     return True
         return False
+
+    def _get_pdf_base64_from_file_id(self, file_id: str) -> Optional[tuple[str, str]]:
+        """
+        Read a PDF file from storage and return base64 encoded data.
+        
+        Args:
+            file_id: The OpenWebUI file ID
+            
+        Returns:
+            tuple[str, str]: (base64_data, filename) or None if not available
+        """
+        if not FILES_AVAILABLE:
+            logger.warning("Files/Storage modules not available for PDF native upload")
+            return None
+            
+        try:
+            file = Files.get_file_by_id(file_id)
+            if not file:
+                logger.warning(f"File not found: {file_id}")
+                return None
+            
+            # Check if it's a PDF
+            content_type = file.meta.get("content_type", "")
+            filename = file.meta.get("name", file.filename)
+            
+            if content_type != "application/pdf" and not filename.lower().endswith(".pdf"):
+                logger.debug(f"File {file_id} is not a PDF: {content_type}")
+                return None
+            
+            # Get file path from storage
+            file_path = Storage.get_file(file.path)
+            file_path = Path(file_path)
+            
+            if not file_path.is_file():
+                logger.warning(f"PDF file not found on disk: {file_path}")
+                return None
+            
+            # Read and encode the PDF
+            with open(file_path, "rb") as pdf_file:
+                pdf_data = pdf_file.read()
+                encoded_data = base64.b64encode(pdf_data).decode("utf-8")
+                
+            # Check size limits (Anthropic has 32MB request limit, be conservative)
+            MAX_PDF_SIZE = 25 * 1024 * 1024  # 25 MB
+            if len(pdf_data) > MAX_PDF_SIZE:
+                logger.warning(f"PDF too large for native upload: {len(pdf_data)} bytes")
+                return None
+                
+            logger.debug(f"Successfully encoded PDF: {filename} ({len(pdf_data)} bytes)")
+            return (encoded_data, filename)
+            
+        except Exception as e:
+            logger.error(f"Error reading PDF file {file_id}: {e}")
+            return None
+
+    def _get_full_context_pdfs(
+        self,
+        __files__: Optional[List[Dict[str, Any]]],
+        use_native_pdf: bool
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        """
+        Extract PDFs from __files__ that should be uploaded as native documents.
+        
+        Args:
+            __files__: List of file objects from OpenWebUI
+            use_native_pdf: Whether native PDF upload is enabled (UserValve)
+            
+        Returns:
+            tuple: (List of document blocks for Anthropic API, List of file IDs processed as native PDFs)
+        """
+        pdf_documents = []
+        processed_file_ids = []
+        
+        if not __files__ or not use_native_pdf or not FILES_AVAILABLE:
+            return pdf_documents, processed_file_ids
+            
+        for file in __files__:
+            # Only process files with 'full' context (not RAG chunks)
+            if file.get("type") != "file" or file.get("context") != "full":
+                continue
+                
+            file_id = file.get("id")
+            if not file_id:
+                continue
+                
+            # Check if it's a PDF
+            file_name = file.get("name", "")
+            if not file_name.lower().endswith(".pdf"):
+                continue
+                
+            # Get base64 encoded PDF
+            result = self._get_pdf_base64_from_file_id(file_id)
+            if result:
+                encoded_data, filename = result
+                pdf_documents.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": encoded_data,
+                    },
+                    "title": filename,
+                    # Add cache_control since PDF content won't change
+                    "cache_control": {"type": "ephemeral"},
+                })
+                processed_file_ids.append(file_id)
+                logger.debug(f"Added PDF as native document: {filename}")
+                
+        return pdf_documents, processed_file_ids
+
+    def _remove_rag_content_for_native_pdfs(
+        self,
+        processed_messages: List[Dict[str, Any]],
+        native_pdf_file_ids: List[str]
+    ) -> None:
+        """
+        Remove RAG <source> content for PDFs that are uploaded natively.
+        This prevents duplicate content (once as PDF, once as RAG text).
+        If all sources are removed, removes the entire RAG template block.
+        
+        Args:
+            processed_messages: List of messages to process
+            native_pdf_file_ids: List of file IDs that were uploaded as native PDFs
+        """
+        if not native_pdf_file_ids or not processed_messages:
+            return
+            
+        # Find the last user message
+        for i in range(len(processed_messages) - 1, -1, -1):
+            if processed_messages[i]["role"] == "user":
+                content = processed_messages[i]["content"]
+                if isinstance(content, list):
+                    # Process each content block
+                    new_content = []
+                    for block in content:
+                        if block.get("type") == "text":
+                            text = block.get("text", "")
+                            # Remove <source> tags for native PDFs
+                            # Pattern: <source id="X" name="filename.pdf">content</source>
+                            import re
+                            
+                            # Track if we removed any sources
+                            original_text = text
+                            
+                            # Find all source tags and check if they reference our PDFs
+                            # We'll match by filename since OpenWebUI uses filename in the name attribute
+                            if FILES_AVAILABLE:
+                                for file_id in native_pdf_file_ids:
+                                    try:
+                                        file = Files.get_file_by_id(file_id)
+                                        if file:
+                                            filename = file.meta.get("name", file.filename)
+                                            # Escape filename for regex
+                                            escaped_filename = re.escape(filename)
+                                            # Pattern to match source tag with this filename
+                                            # Match: <source id="X" name="filename.pdf">any content</source>
+                                            pattern = rf'<source[^>]*name="{escaped_filename}"[^>]*>.*?</source>\s*'
+                                            text = re.sub(pattern, '', text, flags=re.DOTALL)
+                                            if text != original_text:
+                                                logger.debug(f"Removed RAG content for native PDF: {filename}")
+                                                original_text = text
+                                    except Exception as e:
+                                        logger.debug(f"Error removing RAG content for file {file_id}: {e}")
+                            
+                            # Check if there are any <source> tags left
+                            remaining_sources = re.findall(r'<source[^>]*>.*?</source>', text, flags=re.DOTALL)
+                            
+                            # If no sources remain, remove the entire RAG template block
+                            if not remaining_sources and ('<context>' in text or '### Task:' in text):
+                                # Remove entire RAG template structure
+                                # Pattern matches from "### Task:" to end of <context></context> block or similar structure
+                                rag_patterns = [
+                                    r'###\s*Task:.*?<context>.*?</context>',  # Standard RAG template with context tags
+                                    r'###\s*Task:.*?$',  # Fallback: remove from ### Task to end
+                                ]
+                                
+                                for pattern in rag_patterns:
+                                    text = re.sub(pattern, '', text, flags=re.DOTALL | re.MULTILINE)
+                                
+                                # Clean up any leftover empty context tags
+                                text = re.sub(r'<context>\s*</context>', '', text, flags=re.DOTALL)
+                                
+                                if text.strip():
+                                    logger.debug("Removed entire RAG template block (all sources were native PDFs)")
+                            
+                            # Only add block if it still has content after filtering
+                            if text.strip():
+                                block["text"] = text
+                                new_content.append(block)
+                        else:
+                            # Keep non-text blocks as is
+                            new_content.append(block)
+                    
+                    # Update the content with filtered blocks
+                    processed_messages[i]["content"] = new_content
+                break
 
     async def _create_payload(
         self,
@@ -805,6 +1025,30 @@ class Pipe:
                         )
                     break
 
+        # Check if user wants native PDF upload instead of RAG text extraction
+        use_native_pdf = __user__["valves"].USE_PDF_NATIVE_UPLOAD
+        
+        # Get PDF documents to inject as native base64 documents
+        pdf_documents, native_pdf_file_ids = self._get_full_context_pdfs(__files__, use_native_pdf)
+        
+        if pdf_documents and processed_messages:
+            # IMPORTANT: Always inject PDF documents into the FIRST user message
+            # This ensures consistent positioning across all requests for cache stability.
+            # If we inject into the "last" user message, the PDF moves on each turn,
+            # breaking the cache completely.
+            # According to Anthropic docs: "Place PDFs before text in your requests"
+            for i in range(len(processed_messages)):
+                if processed_messages[i]["role"] == "user":
+                    content = processed_messages[i]["content"]
+                    if isinstance(content, list):
+                        # Insert PDF documents at the beginning of FIRST user message
+                        processed_messages[i]["content"] = pdf_documents + content
+                        logger.debug(f"Injected {len(pdf_documents)} PDF document(s) into first user message (index {i}) for cache stability")
+                    break
+            
+            # Remove RAG content for PDFs that are uploaded natively to avoid duplication
+            self._remove_rag_content_for_native_pdfs(processed_messages, native_pdf_file_ids)
+        
         if not processed_messages:
             raise ValueError("No valid messages to process")
 
@@ -1276,6 +1520,15 @@ class Pipe:
         """
         final_message: list[str] = []
 
+        # Initialize total_usage early to prevent UnboundLocalError
+        total_usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
         # Create request-local wrapper for emit_event to prevent cross-talk between parallel requests
         # This ensures each request uses its own __event_emitter__ instead of shared self.eventemitter
         async def emit_event_local(event: dict):
@@ -1383,13 +1636,6 @@ class Pipe:
             citation_counter = 0  # Track citation numbers for inline citations
             citations_list = []  # Store citations for reference list
             retry_attempts = 0
-            total_usage = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-            }
             first_text_emitted = False  # Track if we've emitted "Responding..." status
             # Track active server tool use block
             active_server_tool_name = None
@@ -2549,6 +2795,7 @@ class Pipe:
                     )
         except Exception as e:
             await self.handle_errors(e, __event_emitter__)
+            return final_text()
 
         # Preserve existing generated content; append completion marker
         final_status = "✅ Response processing complete."
