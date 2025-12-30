@@ -1,9 +1,9 @@
 """
-title: Anthropic API Integration
-author: Podden (https://github.com/Podden/)
-github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
+title: Anthropic API Integration (Azure Compatible)
+author: Daniel Carroll
+based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.10
+version: 0.5.10-azure
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -28,8 +28,21 @@ Supports:
 - Context Editing (clear tool results and thinking blocks)
 - Tool Search (BM25/Regex)
 - Native PDF Upload (visual PDF analysis with charts/images)
+- Azure Anthropic API compatibility (date suffix stripping for model names)
+
+Modifications by Daniel Carroll:
+- Added Azure Anthropic API compatibility
+- Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+- Added ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies)
+- Added ENABLED_MODELS valve to specify only deployed models (prevents auto-population of all models)
+- Changed default UserValves: ENABLE_THINKING=True, THINKING_BUDGET_TOKENS=20000, WEB_SEARCH_MAX_USES=8
 
 Changelog:
+v0.5.10-azure
+- Ported Azure compatibility from 0.5.6-azure to 0.5.10
+- Added ENABLED_MODELS valve to specify only your deployed models (e.g., 'claude-sonnet-4,claude-opus-4')
+- When ENABLED_MODELS is set, skips API fetch and static fallback - only shows your specified models
+
 v0.5.10
 - Performance: Pre-compiled regex patterns at module level (5-10x faster pattern matching)
 - Performance: Added debug logging guards to prevent expensive JSON serialization
@@ -230,9 +243,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pattern to match thinking blocks in message content (for removal from history)
-# Matches: <details><summary>🧠 Thinking...</summary>\n...\n</details>
+# Matches: <details><summary>Thinking...</summary>\n...\n</details>
 PATTERN_THINKING_BLOCK = re.compile(
-    r"<details>\s*<summary>🧠.*?</summary>.*?</details>\s*",
+    r"<details>\s*<summary>.*?Thinking.*?</summary>.*?</details>\s*",
     flags=re.DOTALL
 )
 
@@ -452,7 +465,7 @@ class Pipe:
     REQUEST_TIMEOUT = (
         300  # Increased timeout for longer responses with extended thinking
     )
-    THINKING_BUDGET_TOKENS = 4096  # Default thinking budget tokens (max 16K)
+    THINKING_BUDGET_TOKENS = 20000  # Default thinking budget tokens
     TOOL_CALL_TIMEOUT = 120  # Seconds before a tool call is treated as timed out
 
     @classmethod
@@ -481,6 +494,14 @@ class Pipe:
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = "Your API Key Here"
+        ANTHROPIC_API_BASE: str = Field(
+            default="https://api.anthropic.com",
+            description="Base URL for Anthropic API. For Azure: https://<resource>.cognitiveservices.azure.com/anthropic",
+        )
+        ENABLED_MODELS: str = Field(
+            default="",
+            description="Comma-separated list of model names to enable (e.g., 'claude-sonnet-4,claude-opus-4'). Leave empty to auto-fetch from API or use all static models.",
+        )
         # ENABLE_CLAUDE_MEMORY: bool = Field(
         #     default=False,
         #     description="Enable Claude memory tool",
@@ -594,11 +615,11 @@ class Pipe:
 
     class UserValves(BaseModel):
         ENABLE_THINKING: bool = Field(
-            default=False,
+            default=True,
             description="Enable Extended Thinking",
         )
         THINKING_BUDGET_TOKENS: int = Field(
-            default=8192,
+            default=20000,
             ge=0,
             le=64000,
             description="Thinking budget tokens",
@@ -616,7 +637,7 @@ class Pipe:
             description="Show Context Window Progress",
         )
         WEB_SEARCH_MAX_USES: int = Field(
-            default=5,
+            default=8,
             ge=1,
             le=20,
             description="Maximum number of web searches",
@@ -650,13 +671,38 @@ class Pipe:
         """
         Fetches the current list of Anthropic models using the official Anthropic Python SDK.
         Fallback to static list on error. Returns OpenWebUI model dicts.
+
+        If ENABLED_MODELS valve is set, only returns those specific models.
         """
         from anthropic import AsyncAnthropic
 
         models = []
+
+        # If ENABLED_MODELS is specified, only return those models
+        if self.valves.ENABLED_MODELS.strip():
+            enabled_list = [m.strip() for m in self.valves.ENABLED_MODELS.split(",") if m.strip()]
+            for name in enabled_list:
+                info = self.get_model_info(name)
+                models.append(
+                    {
+                        "id": f"anthropic/{name}",
+                        "name": name,
+                        "context_length": info["context_length"],
+                        "supports_vision": info["supports_vision"],
+                        "supports_thinking": info["supports_thinking"],
+                        "is_hybrid_model": info["supports_thinking"],
+                        "max_output_tokens": info["max_tokens"],
+                        "info": {"meta": {"capabilities": {"status_updates": True}}},
+                    }
+                )
+            return models
+
+        # Otherwise, try to fetch from API
         try:
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(
+                api_key=api_key, base_url=self.valves.ANTHROPIC_API_BASE
+            )
             async for m in client.models.list():
                 name = m.id
                 display_name = getattr(m, "display_name", name)
@@ -938,6 +984,10 @@ class Pipe:
         __files__: Optional[Dict[str, Any]] = None,
     ) -> tuple[dict, dict]:
         actual_model_name = body["model"].split("/")[-1]
+        # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+        import re
+
+        actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
         model_info = self.get_model_info(actual_model_name)
         max_tokens_limit = model_info["max_tokens"]
         requested_max_tokens = body.get("max_tokens", max_tokens_limit)
@@ -1199,7 +1249,7 @@ class Pipe:
                             "type": "notification",
                             "data": {
                                 "type": "info",
-                                "content": "🧠 Thinking mode is active - Web search was added but not enforced. Claude can use it if needed.",
+                                "content": "Thinking mode is active - Web search was added but not enforced. Claude can use it if needed.",
                             },
                         },
                         __event_emitter__,
@@ -1695,7 +1745,11 @@ class Pipe:
             )
 
             api_key = headers.get("x-api-key", self.valves.ANTHROPIC_API_KEY)
-            client = AsyncAnthropic(api_key=api_key, default_headers=headers)
+            client = AsyncAnthropic(
+                api_key=api_key,
+                base_url=self.valves.ANTHROPIC_API_BASE,
+                default_headers=headers,
+            )
             payload_for_stream = {k: v for k, v in payload.items() if k != "stream"}
 
             # =========================================================================
@@ -1879,7 +1933,7 @@ class Pipe:
                                     chunk += content_block.text or ""
                                 if content_type == "thinking":
                                     is_model_thinking = True
-                                    thinking_message = "\n<details>\n<summary>🧠 Thoughts</summary>\n\n"
+                                    thinking_message = "\n<details>\n<summary>Thoughts</summary>\n\n"
                                     current_thinking_block = {
                                         "type": "thinking",
                                         "thinking": "",
@@ -3014,6 +3068,8 @@ class Pipe:
         try:
             # Extract model and messages from body
             actual_model_name = body["model"].split("/")[-1]
+            # Strip date suffix for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
+            actual_model_name = re.sub(r"-\d{8}$", "", actual_model_name)
             messages = body.get("messages", [])
 
             # Build simple payload for task request (non-streaming)
@@ -3037,7 +3093,9 @@ class Pipe:
             # Make synchronous request to Anthropic API
             # For task requests, we don't have __user__ context, so use default key
             api_key = self.valves.ANTHROPIC_API_KEY
-            client = AsyncAnthropic(api_key=api_key)
+            client = AsyncAnthropic(
+                api_key=api_key, base_url=self.valves.ANTHROPIC_API_BASE
+            )
 
             response = await client.messages.create(**task_payload)
 
@@ -3212,7 +3270,7 @@ class Pipe:
         re-sent to the API in subsequent requests.
 
         Removes HTML details blocks containing thinking content, e.g.:
-        <details><summary>🧠 Thinking...</summary>\n...\n</details>
+        <details><summary>Thinking...</summary>\n...\n</details>
 
         Note: Does not strip whitespace - stripping is handled elsewhere as needed.
         Uses pre-compiled PATTERN_THINKING_BLOCK for performance.
