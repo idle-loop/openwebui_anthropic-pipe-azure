@@ -1,6 +1,6 @@
 """
 title: Anthropic API Integration (Azure Compatible)
-author: Daniel Carroll
+author: idle-loop (https://github.com/idle-loop)
 based_on: Podden (https://github.com/Podden/openwebui_anthropic_api_manifold_pipe)
 original_author: Balaxxe (Updated by nbellochi)
 version: 0.5.10-azure
@@ -30,7 +30,7 @@ Supports:
 - Native PDF Upload (visual PDF analysis with charts/images)
 - Azure Anthropic API compatibility (date suffix stripping for model names)
 
-Modifications by Daniel Carroll:
+Modifications by idle-loop:
 - Added Azure Anthropic API compatibility
 - Model name date suffix stripping for Azure deployments (e.g., claude-opus-4-5-20251101 → claude-opus-4-5)
 - Added ANTHROPIC_API_BASE valve for custom endpoints (Azure, proxies)
